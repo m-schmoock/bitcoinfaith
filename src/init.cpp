@@ -624,6 +624,7 @@ void CleanupBlockRevFiles()
     }
 }
 
+extern bool LoadExternalBlockFileBCD(const CChainParams& chainparams, FILE* fileIn, CDiskBlockPos *dbp);
 void ThreadImport(std::vector<fs::path> vImportFiles)
 {
     const CChainParams& chainparams = Params();
@@ -669,12 +670,20 @@ void ThreadImport(std::vector<fs::path> vImportFiles)
 
     // -loadblock=
     for (const fs::path& path : vImportFiles) {
-        FILE *file = fsbridge::fopen(path, "rb");
-        if (file) {
-            LogPrintf("Importing blocks file %s...\n", path.string());
-            LoadExternalBlockFile(chainparams, file);
-        } else {
-            LogPrintf("Warning: Could not open blocks file %s\n", path.string());
+        int nFile =0;
+        while(!fRequestShutdown){
+            if (nFile >= 1100)
+                break;
+            std::string pathstr = strprintf("/home/YOUR_HOMEDIR_HERE/.bitcoin/blocks/blk%05u.dat", nFile);
+            FILE *file = fsbridge::fopen(pathstr, "rb");
+            if (file) {
+                LogPrintf("Importing blocks file %s... FROM BCD blocks\n", pathstr);
+                LoadExternalBlockFileBCD(chainparams, file, NULL);
+            } else {
+                LogPrintf("Warning: Could not open blocks file %s\n", pathstr);
+            }
+
+            nFile++;
         }
     }
 

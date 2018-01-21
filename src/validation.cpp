@@ -3223,6 +3223,8 @@ static bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CValidation
         if (dbp == nullptr)
             if (!WriteBlockToDisk(block, blockPos, chainparams.MessageStart()))
                 AbortNode(state, "Failed to write block");
+            else
+                LogPrintf("Write BLOCK Return ok %i \n", nHeight);
         if (!ReceivedBlockTransactions(block, state, pindex, blockPos, chainparams.GetConsensus()))
             return error("AcceptBlock(): ReceivedBlockTransactions failed");
     } catch (const std::runtime_error& e) {
@@ -3999,6 +4001,148 @@ bool LoadGenesisBlock(const CChainParams& chainparams)
     }
 
     return true;
+}
+
+// BTF fork block 499999
+static const uint256 fork_hash = uint256S("0000000000000000007962066dcd6675830883516bcf40047d42740a85eb2919");
+static bool fork_hash_reached = false;
+static const unsigned char magic[4] = {0xf9, 0xbe, 0xb4, 0xd9}; // BTC TODO: read from block file hexdumd
+//static const unsigned char magic[4] = {0xe1, 0x47, 0x6d, 0x44}; // BTG
+
+bool LoadExternalBlockFileBCD(const CChainParams& chainparams, FILE* fileIn, CDiskBlockPos *dbp)
+{
+    // Map of disk positions for blocks with unknown parent (only used for reindex)
+    static std::multimap<uint256, CDiskBlockPos> mapBlocksUnknownParent;
+    int64_t nStart = GetTimeMillis();
+
+    int nLoaded = 0;
+    try {
+        // This takes over fileIn and calls fclose() on it in the CBufferedFile destructor
+        CBufferedFile blkdat(fileIn, 2*MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE+8, SER_DISK, CLIENT_VERSION);
+        uint64_t nRewind = blkdat.GetPos();
+        while (!blkdat.eof()) {
+            boost::this_thread::interruption_point();
+
+            blkdat.SetPos(nRewind);
+            nRewind++; // start one byte further next time, in case of failure
+            blkdat.SetLimit(); // remove former limit
+            unsigned int nSize = 0;
+            try {
+                // locate a header
+                unsigned char buf[CMessageHeader::MESSAGE_START_SIZE];
+                blkdat.FindByte(magic[0]);
+                nRewind = blkdat.GetPos()+1;
+                blkdat >> FLATDATA(buf);
+                if (memcmp(buf, magic, CMessageHeader::MESSAGE_START_SIZE))
+                    continue;
+                // read size
+                blkdat >> nSize;
+                if (nSize < 80 || nSize > MAX_BLOCK_SERIALIZED_SIZE)
+                    continue;
+            } catch (const std::exception&) {
+                // no valid block header found; don't complain
+                break;
+            }
+            try {
+                // read block
+                uint64_t nBlockPos = blkdat.GetPos();
+                if (dbp)
+                    dbp->nPos = nBlockPos;
+                blkdat.SetLimit(nBlockPos + nSize);
+                blkdat.SetPos(nBlockPos);
+                std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
+                CBlock& block = *pblock;
+                blkdat >> block;
+                nRewind = blkdat.GetPos();
+
+                LogPrintf("height: ?? version: %d hash: %s prev: %s\n",
+                            /*block.nHeight,*/ block.nVersion,
+                            block.GetHash().ToString(),
+                            block.hashPrevBlock.ToString());
+
+                // detect out of order blocks, and store them for later
+                uint256 hash = block.GetHash();
+                if (hash != chainparams.GetConsensus().hashGenesisBlock && mapBlockIndex.find(block.hashPrevBlock) == mapBlockIndex.end()) {
+                    LogPrintf("%s: Out of order block %s, parent %s not known\n", __func__, hash.ToString(),
+                            block.hashPrevBlock.ToString());
+                    if (dbp)
+                        mapBlocksUnknownParent.insert(std::make_pair(block.hashPrevBlock, *dbp));
+                    continue;
+                }
+
+                if (mapBlockIndex.count(hash) == 0 || (mapBlockIndex[hash]->nStatus & BLOCK_HAVE_DATA) == 0) {
+                    LOCK(cs_main);
+                    CValidationState state;
+                    LogPrint(BCLog::REINDEX, "Found prev hash in index\n");
+
+                    if (block.GetHash() == fork_hash || fork_hash_reached) {
+                        LogPrintf("LAST BLOCK BEFORE FORK REACHED, ABORTING: %s", fork_hash.ToString());
+                        fork_hash_reached = true;
+                        break;
+                    }
+                    if (AcceptBlock(pblock, state, chainparams, nullptr, true, dbp, nullptr))
+                    {
+                        LogPrintf("BLOCK ACCEPTEED %s \n", block.GetHash().ToString());
+                        nLoaded++;
+                    }else
+                    {
+                        LogPrintf("BLOCK REJECTED %s \n", block.GetHash().ToString());
+                    }
+                    if (state.IsError())
+                        break;
+                } else if (hash != chainparams.GetConsensus().hashGenesisBlock && mapBlockIndex[hash]->nHeight % 1000 == 0) {
+                    LogPrintf("Block Import: already had block %s at height %d\n", hash.ToString(), mapBlockIndex[hash]->nHeight);
+                }
+
+                // Activate the genesis block so normal node progress can continue
+                if (hash == chainparams.GetConsensus().hashGenesisBlock) {
+                    LogPrintf("Found Genesis Block\n" );
+                    CValidationState state;
+                    if (!ActivateBestChain(state, chainparams)) {
+                        break;
+                    }
+                }
+
+                NotifyHeaderTip();
+#if 0
+                // Recursively process earlier encountered successors of this block
+                std::deque<uint256> queue;
+                queue.push_back(hash);
+                while (!queue.empty()) {
+                    uint256 head = queue.front();
+                    queue.pop_front();
+                    std::pair<std::multimap<uint256, CDiskBlockPos>::iterator, std::multimap<uint256, CDiskBlockPos>::iterator> range = mapBlocksUnknownParent.equal_range(head);
+                    while (range.first != range.second) {
+                        std::multimap<uint256, CDiskBlockPos>::iterator it = range.first;
+                        std::shared_ptr<CBlock> pblockrecursive = std::make_shared<CBlock>();
+                        if (ReadBlockFromDisk(*pblockrecursive, it->second, chainparams.GetConsensus()))
+                        {
+                            LogPrint(BCLog::REINDEX, "%s: Processing out of order child %s of %s\n", __func__, pblockrecursive->GetHash().ToString(),
+                                    head.ToString());
+                            LOCK(cs_main);
+                            CValidationState dummy;
+                            if (AcceptBlock(pblockrecursive, dummy, chainparams, nullptr, true, &it->second, nullptr))
+                            {
+                                nLoaded++;
+                                queue.push_back(pblockrecursive->GetHash());
+                            }
+                        }
+                        range.first++;
+                        mapBlocksUnknownParent.erase(it);
+                        NotifyHeaderTip();
+                    }
+                }
+#endif
+            } catch (const std::exception& e) {
+                LogPrintf("%s: Deserialize or I/O error - %s\n", __func__, e.what());
+            }
+        }
+    } catch (const std::runtime_error& e) {
+        AbortNode(std::string("System error: ") + e.what());
+    }
+    if (nLoaded > 0)
+        LogPrintf("Loaded %i blocks from external file in %dms\n", nLoaded, GetTimeMillis() - nStart);
+    return nLoaded > 0;
 }
 
 bool LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, CDiskBlockPos *dbp)
